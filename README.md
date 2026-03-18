@@ -4,8 +4,7 @@ Draw in the air using your hand in real-time using Computer Vision!
 
 ---
 
-## 🎥 Demo
-(⬇️ Add your GIF here later)
+
 
 ---
 
