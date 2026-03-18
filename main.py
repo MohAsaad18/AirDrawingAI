@@ -7,17 +7,36 @@ GESTURE GUIDE
   [0 fingers]  Fist              ->  Clear canvas
   [5 fingers]  All fingers up    ->  Screenshot
 
-KEYS:  q = quit  |  s = screenshot
+KEYS:
+  q         = quit
+  s         = screenshot
+  h         = toggle help
+  + / =     = brush bigger
+  -         = brush smaller
+  [ / ]     = adjust detection confidence
 """
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import time
-import os
+import sys
+import logging
+import argparse
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Optional
+from typing import Optional, Tuple
+from pathlib import Path
+
+
+# ════════════════════════════════════════════════════════
+#  LOGGING
+# ════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════
@@ -25,13 +44,18 @@ from typing import Optional
 # ════════════════════════════════════════════════════════
 @dataclass
 class Config:
-    cam_w: int = 1280
-    cam_h: int = 720
+    # Camera
+    cam_w:        int   = 1280
+    cam_h:        int   = 720
+    camera_id:    int   = 0
+    fps_limit:    int   = 30
 
-    max_hands: int = 1
-    detection_conf: float = 0.75
-    tracking_conf: float  = 0.75
+    # Hand tracking
+    max_hands:       int   = 1
+    detection_conf:  float = 0.75
+    tracking_conf:   float = 0.75
 
+    # Brush
     default_brush: int = 15
     min_brush:     int = 3
     max_brush:     int = 60
@@ -39,6 +63,7 @@ class Config:
     eraser_size:   int = 60
     tip_smooth:    int = 6
 
+    # Gesture
     gesture_hold:  int   = 3
     shot_cooldown: float = 2.0
     shot_dir:      str   = "Screenshots"
@@ -55,9 +80,12 @@ class Config:
         ("ERASE",  (  0,   0,   0)),
     ])
 
-    header_h: int   = 92
-    tile_gap:  int   = 7
-    accent:    tuple = (255, 255, 255)
+    # UI
+    header_h:       int   = 92
+    tile_gap:       int   = 7
+    accent:         tuple = (255, 255, 255)
+    show_confidence: bool = False
+    debug_mode:     bool  = False
 
 
 CFG = Config()
@@ -74,28 +102,40 @@ TIP   = [4, 8, 12, 16, 20]
 
 class HandDetector:
     def __init__(self):
-        self._h = _mph.Hands(
-            static_image_mode=False,
-            max_num_hands=CFG.max_hands,
-            min_detection_confidence=CFG.detection_conf,
-            min_tracking_confidence=CFG.tracking_conf,
-        )
-
-    def process(self, bgr: np.ndarray) -> list:
-        res = self._h.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        if res.multi_hand_landmarks:
-            _mpd.draw_landmarks(
-                bgr, res.multi_hand_landmarks[0],
-                _mph.HAND_CONNECTIONS,
-                _mpds.get_default_hand_landmarks_style(),
-                _mpds.get_default_hand_connections_style(),
+        try:
+            self._h = _mph.Hands(
+                static_image_mode=False,
+                max_num_hands=CFG.max_hands,
+                min_detection_confidence=CFG.detection_conf,
+                min_tracking_confidence=CFG.tracking_conf,
             )
-            h, w = bgr.shape[:2]
-            return [
-                [i, int(lm.x * w), int(lm.y * h)]
-                for i, lm in enumerate(res.multi_hand_landmarks[0].landmark)
-            ]
-        return []
+            logger.info("Hand detector ready")
+        except Exception as e:
+            logger.error(f"Hand detector init failed: {e}")
+            raise
+
+    def process(self, bgr: np.ndarray) -> Tuple[list, float]:
+        """Return (landmarks, confidence). Draws skeleton on bgr."""
+        try:
+            res = self._h.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            if res.multi_hand_landmarks and res.multi_handedness:
+                _mpd.draw_landmarks(
+                    bgr, res.multi_hand_landmarks[0],
+                    _mph.HAND_CONNECTIONS,
+                    _mpds.get_default_hand_landmarks_style(),
+                    _mpds.get_default_hand_connections_style(),
+                )
+                h, w = bgr.shape[:2]
+                conf = res.multi_handedness[0].classification[0].score
+                lm   = [
+                    [i, int(lm.x * w), int(lm.y * h)]
+                    for i, lm in enumerate(res.multi_hand_landmarks[0].landmark)
+                ]
+                return lm, conf
+            return [], 0.0
+        except Exception as e:
+            logger.error(f"Frame processing error: {e}")
+            return [], 0.0
 
     @staticmethod
     def fingers_up(lm: list) -> list:
@@ -111,10 +151,10 @@ class HandDetector:
 #  GESTURE ENGINE  (debounced)
 # ════════════════════════════════════════════════════════
 _GESTURES = [
-    ("draw",       lambda f: f[1] == 1 and f[2] == 0 and f[3] == 0 and f[4] == 0),
+    ("screenshot", lambda f: f[1] == 1 and f[2] == 1 and f[3] == 1 and f[4] == 1),
     ("select",     lambda f: f[1] == 1 and f[2] == 1 and f[3] == 0 and f[4] == 0),
+    ("draw",       lambda f: f[1] == 1 and f[2] == 0 and f[3] == 0 and f[4] == 0),
     ("clear",      lambda f: sum(f) == 0),
-    ("screenshot", lambda f: sum(f) == 5),
 ]
 
 
@@ -154,7 +194,7 @@ class TipSmoother:
         self._x: deque = deque(maxlen=CFG.tip_smooth)
         self._y: deque = deque(maxlen=CFG.tip_smooth)
 
-    def update(self, x: int, y: int) -> tuple:
+    def update(self, x: int, y: int) -> Tuple[int, int]:
         self._x.append(x); self._y.append(y)
         return int(np.mean(self._x)), int(np.mean(self._y))
 
@@ -163,7 +203,7 @@ class TipSmoother:
 
 
 # ════════════════════════════════════════════════════════
-#  UI RENDERER  — ASCII only (OpenCV cannot render emoji)
+#  UI RENDERER  (ASCII only — OpenCV cannot render emoji)
 # ════════════════════════════════════════════════════════
 F  = cv2.FONT_HERSHEY_SIMPLEX
 F2 = cv2.FONT_HERSHEY_DUPLEX
@@ -176,10 +216,27 @@ _GESTURE_DISPLAY = {
 }
 
 _LEGEND = [
-    ("[1] Index         DRAW",    ( 80, 220,  80)),
-    ("[2] Index+Mid     SELECT",  ( 80, 220, 220)),
-    ("[0] Fist          CLEAR",   ( 60,  60, 255)),
-    ("[5] All up        SNAP",    ( 60, 200, 255)),
+    ("[1] Index        DRAW",       ( 80, 220,  80)),
+    ("[2] Index+Mid    SELECT",     ( 80, 220, 220)),
+    ("[0] Fist         CLEAR",      ( 60,  60, 255)),
+    ("[4] 4 Fingers    SNAP",       ( 60, 200, 255)),
+]
+
+_HELP_LINES = [
+    ("--- AIR DRAWING AI  HELP ---", (255, 200, 50)),
+    ("",                              (200, 200, 200)),
+    ("GESTURES:",                     (180, 180, 220)),
+    ("  1 Finger    Draw",            (200, 200, 200)),
+    ("  2 Fingers   Select Color",    (200, 200, 200)),
+    ("  Fist        Clear Canvas",    (200, 200, 200)),
+    ("  4 Fingers   Screenshot",      (200, 200, 200)),
+    ("",                              (200, 200, 200)),
+    ("KEYBOARD:",                     (180, 180, 220)),
+    ("  Q           Quit",            (200, 200, 200)),
+    ("  S           Screenshot",      (200, 200, 200)),
+    ("  + / -       Brush size",      (200, 200, 200)),
+    ("  [ / ]       Detection conf",  (200, 200, 200)),
+    ("  H           Toggle Help",     (200, 200, 200)),
 ]
 
 
@@ -193,21 +250,20 @@ def _blend(img, x1, y1, x2, y2, bgr, alpha=0.6):
 
 
 def _put(img, text, x, y, scale=0.55, color=(255, 255, 255), thick=1):
-    """Text with black drop-shadow."""
-    cv2.putText(img, text, (x + 1, y + 1), F, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y),          F, scale, color,     thick,     cv2.LINE_AA)
+    """Text with black drop-shadow for readability on any background."""
+    cv2.putText(img, text, (x + 1, y + 1), F, scale, (0, 0, 0),   thick + 2, cv2.LINE_AA)
+    cv2.putText(img, text, (x,     y),     F, scale, color, thick,            cv2.LINE_AA)
 
 
 class UIRenderer:
     def __init__(self):
-        n = len(CFG.palette)
+        n            = len(CFG.palette)
         self._n      = n
         self._tile_w = (CFG.cam_w - CFG.tile_gap * (n + 1)) // n
 
+    # ── Palette bar ──────────────────────────────────────────────────
     def draw_palette(self, img: np.ndarray, active: tuple):
-        H = CFG.header_h
-        g = CFG.tile_gap
-
+        H, g = CFG.header_h, CFG.tile_gap
         _blend(img, 0, 0, CFG.cam_w, H, (12, 12, 18), alpha=0.88)
         cv2.line(img, (0, H), (CFG.cam_w, H), (55, 55, 75), 1)
 
@@ -217,7 +273,6 @@ class UIRenderer:
             y1, y2 = g, H - 18
 
             selected = (col == active)
-
             _blend(img, x1, y1, x2, y2, col, alpha=0.92)
 
             if selected:
@@ -238,84 +293,97 @@ class UIRenderer:
                         (255, 255, 255) if selected else (160, 160, 200),
                         1, cv2.LINE_AA)
 
+    # ── HUD overlays ────────────────────────────────────────────────
     def draw_hud(self, img: np.ndarray, gesture: Optional[str],
-                 brush: int, active: tuple, fps: float):
+                 brush: int, active: tuple, fps: float, confidence: float = 0.0):
         W, H, hh = CFG.cam_w, CFG.cam_h, CFG.header_h
 
         # Bottom strip
         _blend(img, 0, H - 30, W, H, (10, 10, 16), alpha=0.88)
         _put(img,
-             "q=quit  s=snap  +=bigger  -=smaller  |  1-finger=draw  2-finger=select  fist=clear  5-finger=snap",
-             14, H - 10, 0.38, (130, 130, 170))
+             "q=quit  s=snap  h=help  +=bigger  -=smaller  [/]=confidence  |  1=draw  2=select  fist=clear  4fingers=snap",
+             14, H - 10, 0.35, (130, 130, 170))
 
-        # FPS
-        _put(img, f"FPS {int(fps)}", 14, hh + 24, 0.55, (80, 220, 180))
+        # FPS (+ optional confidence)
+        fps_label = f"FPS {int(fps)}"
+        if CFG.show_confidence:
+            fps_label += f"  |  Conf {confidence:.2f}"
+        _put(img, fps_label, 14, hh + 24, 0.55, (80, 220, 180))
 
-        # ── Brush size panel (left side) ─────────────────────────
-        px, py = 14, hh + 40
-        panel_w, panel_h = 130, 70
+        # ── Brush size panel ─────────────────────────────────────────
+        px, py     = 14, hh + 40
+        panel_w    = 160
+        panel_h    = 70
         _blend(img, px, py, px + panel_w, py + panel_h, (12, 12, 20), alpha=0.75)
         cv2.rectangle(img, (px, py), (px + panel_w, py + panel_h), (45, 45, 65), 1)
 
         _put(img, "SIZE  +/-", px + 8, py + 18, 0.42, (160, 160, 200))
 
-        # Slider track
+        # Track
         sx1, sx2 = px + 10, px + panel_w - 10
-        sy = py + 38
+        sy        = py + 38
         cv2.line(img, (sx1, sy), (sx2, sy), (55, 55, 75), 3)
 
-        # Slider fill
-        ratio   = (brush - CFG.min_brush) / max(CFG.max_brush - CFG.min_brush, 1)
-        fill_x  = int(sx1 + ratio * (sx2 - sx1))
-        d_col   = active if active != (0, 0, 0) else (150, 150, 150)
+        # Fill + thumb
+        ratio  = (brush - CFG.min_brush) / max(CFG.max_brush - CFG.min_brush, 1)
+        fill_x = int(sx1 + ratio * (sx2 - sx1))
+        d_col  = active if active != (0, 0, 0) else (150, 150, 150)
         cv2.line(img, (sx1, sy), (fill_x, sy), d_col, 3)
-
-        # Slider thumb
         cv2.circle(img, (fill_x, sy), 7, d_col, -1)
         cv2.circle(img, (fill_x, sy), 7, (200, 200, 200), 1)
 
-        # Brush dot preview + px label
+        # Brush dot preview
         r = max(brush // 2, 2)
         cv2.circle(img, (px + 20, py + 57), r, d_col, -1)
         cv2.circle(img, (px + 20, py + 57), r, (50, 50, 50), 1)
         _put(img, f"{brush}px", px + 20 + r + 6, py + 62, 0.44, (190, 190, 190))
 
-        # Gesture badge (centred)
+        # ── Gesture badge (centre) ───────────────────────────────────
         if gesture and gesture in _GESTURE_DISPLAY:
             label, g_col = _GESTURE_DISPLAY[gesture]
-            (tw, th), _ = cv2.getTextSize(label, F2, 0.95, 2)
-            gx  = (W - tw) // 2
-            gy  = hh + 52
-            pad = 16
+            (tw, th), _  = cv2.getTextSize(label, F2, 0.95, 2)
+            gx, gy, pad  = (W - tw) // 2, hh + 52, 16
             _blend(img, gx - pad, gy - th - pad, gx + tw + pad, gy + pad // 2,
                    g_col, alpha=0.28)
             cv2.rectangle(img,
                           (gx - pad, gy - th - pad),
-                          (gx + tw + pad, gy + pad // 2),
-                          g_col, 1)
+                          (gx + tw + pad, gy + pad // 2), g_col, 1)
             cv2.putText(img, label, (gx + 1, gy + 1), F2, 0.95, (0,0,0), 4, cv2.LINE_AA)
             cv2.putText(img, label, (gx,     gy),     F2, 0.95, g_col,   2, cv2.LINE_AA)
 
-        # Right legend panel
-        lx   = W - 248
-        ph   = len(_LEGEND) * 26 + 16
+        # ── Right legend panel ───────────────────────────────────────
+        lx = W - 248
+        ph = len(_LEGEND) * 26 + 16
         _blend(img, lx - 12, hh + 8, W - 10, hh + 8 + ph, (12, 12, 20), alpha=0.75)
         cv2.rectangle(img, (lx - 12, hh + 8), (W - 10, hh + 8 + ph), (45, 45, 65), 1)
         for j, (txt, col) in enumerate(_LEGEND):
             _put(img, txt, lx, hh + 30 + j * 26, 0.44, col)
 
+    # ── Help overlay ─────────────────────────────────────────────────
+    def draw_help(self, img: np.ndarray):
+        line_h   = 22
+        panel_w  = 340
+        panel_h  = len(_HELP_LINES) * line_h + 24
+        px       = (CFG.cam_w - panel_w) // 2
+        py       = (CFG.cam_h - panel_h) // 2
+        _blend(img, px - 14, py - 14, px + panel_w + 14, py + panel_h + 14,
+               (18, 18, 28), alpha=0.88)
+        cv2.rectangle(img,
+                      (px - 14, py - 14),
+                      (px + panel_w + 14, py + panel_h + 14),
+                      (90, 90, 140), 2)
+        for i, (line, col) in enumerate(_HELP_LINES):
+            if line:
+                _put(img, line, px, py + 18 + i * line_h, 0.44, col)
+
+    # ── Toast banner ─────────────────────────────────────────────────
     def draw_toast(self, img: np.ndarray, text: str, color: tuple):
-        scale = 1.2
+        scale       = 1.2
         (tw, th), _ = cv2.getTextSize(text, F2, scale, 3)
-        cx  = (CFG.cam_w - tw) // 2
-        cy  = CFG.cam_h // 2
-        pad = 20
+        cx, cy, pad = (CFG.cam_w - tw) // 2, CFG.cam_h // 2, 20
         _blend(img, cx - pad, cy - th - pad, cx + tw + pad, cy + pad,
                (8, 8, 12), alpha=0.82)
-        cv2.rectangle(img,
-                      (cx - pad, cy - th - pad),
-                      (cx + tw + pad, cy + pad),
-                      color, 2)
+        cv2.rectangle(img, (cx - pad, cy - th - pad), (cx + tw + pad, cy + pad), color, 2)
         cv2.putText(img, text, (cx + 1, cy + 1), F2, scale, (0,0,0), 5, cv2.LINE_AA)
         cv2.putText(img, text, (cx,     cy),     F2, scale, color,   3, cv2.LINE_AA)
 
@@ -341,6 +409,7 @@ class Toast:
 
     def show(self, msg: str, color=(255, 255, 255), dur=1.2):
         self._msg, self._color, self._exp = msg, color, time.time() + dur
+        logger.info(f"Toast: {msg}")
 
     def render(self, img: np.ndarray, ui: UIRenderer):
         if self._msg and time.time() < self._exp:
@@ -348,32 +417,72 @@ class Toast:
 
 
 # ════════════════════════════════════════════════════════
-#  MAIN APP
+#  MAIN APP  (context manager)
 # ════════════════════════════════════════════════════════
 class AirDrawingApp:
     def __init__(self):
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.cam_w)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.cam_h)
-
-        self.detector = HandDetector()
-        self.gestures = GestureEngine()
-        self.smoother = TipSmoother()
-        self.ui       = UIRenderer()
-        self.toast    = Toast()
-
-        self.canvas = np.zeros((CFG.cam_h, CFG.cam_w, 3), np.uint8)
-        self.color  = CFG.palette[0][1]
-        self.brush  = CFG.default_brush
+        self.cap      = None
+        self.detector = None
+        self.gestures = None
+        self.smoother = None
+        self.ui       = None
+        self.toast    = None
+        self.canvas   = None
+        self.color    = None
+        self.brush    = None
 
         self._xp = self._yp = 0
-        self._drawing   = False
-        self._last_shot = 0.0
-        self._ptime     = time.time()
+        self._drawing      = False
+        self._last_shot    = 0.0
+        self._ptime        = time.time()
+        self._frame_count  = 0
+        self._show_help    = False
+        self._confidence   = 0.0
 
-        os.makedirs(CFG.shot_dir, exist_ok=True)
-        print(__doc__)
+        self._init()
 
+    def _init(self):
+        try:
+            self.cap = cv2.VideoCapture(CFG.camera_id)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Cannot open camera {CFG.camera_id}")
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CFG.cam_w)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.cam_h)
+            logger.info(f"Camera {CFG.camera_id} opened  ({CFG.cam_w}x{CFG.cam_h})")
+
+            self.detector = HandDetector()
+            self.gestures = GestureEngine()
+            self.smoother = TipSmoother()
+            self.ui       = UIRenderer()
+            self.toast    = Toast()
+
+            self.canvas = np.zeros((CFG.cam_h, CFG.cam_w, 3), np.uint8)
+            self.color  = CFG.palette[0][1]
+            self.brush  = CFG.default_brush
+
+            Path(CFG.shot_dir).mkdir(exist_ok=True)
+            logger.info("All components initialised")
+        except Exception as e:
+            logger.error(f"Init failed: {e}")
+            self._cleanup()
+            raise
+
+    def _cleanup(self):
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
+        logger.info("Resources released")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._cleanup()
+        if exc_type:
+            logger.error(f"Exception on exit: {exc_val}")
+        return False
+
+    # ── helpers ─────────────────────────────────────────────────────
     def _merge(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
         _, inv = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
@@ -394,82 +503,173 @@ class AirDrawingApp:
         cv2.imwrite(f"{CFG.shot_dir}/combined_{ts}.png", self._merge(frame))
         self._last_shot = now
         self.toast.show("SNAPSHOT SAVED", (60, 210, 255), 1.4)
-        print(f"  Saved: {CFG.shot_dir}/combined_{ts}.png")
+        logger.info(f"Saved to {CFG.shot_dir}/combined_{ts}.png")
 
+    def _set_confidence(self, delta: float):
+        new = round(max(0.3, min(1.0, CFG.detection_conf + delta)), 2)
+        if new != CFG.detection_conf:
+            CFG.detection_conf = new
+            self.detector = HandDetector()   # re-init with new threshold
+            self.toast.show(f"Conf: {new:.2f}", (100, 200, 255), 1.0)
+            logger.info(f"Detection confidence -> {new}")
+
+    # ── main loop ────────────────────────────────────────────────────
     def run(self):
-        while True:
-            ok, frame = self.cap.read()
-            if not ok:
-                break
-            frame = cv2.flip(frame, 1)
+        logger.info("Running — press H for help, Q to quit")
+        target_dt = 1.0 / CFG.fps_limit
 
-            lm      = self.detector.process(frame)
-            fingers = HandDetector.fingers_up(lm)
-            g       = self.gestures.update(fingers)
+        try:
+            while True:
+                t0 = time.time()
 
-            if lm:
-                x1, y1 = self.smoother.update(lm[8][1], lm[8][2])
+                ok, frame = self.cap.read()
+                if not ok:
+                    logger.warning("Frame read failed")
+                    break
+                frame = cv2.flip(frame, 1)
 
-                if g == "clear":
-                    self._end_stroke()
-                    self.canvas = np.zeros_like(self.canvas)
-                    self.toast.show("CANVAS CLEARED", (60, 60, 255))
+                lm, conf  = self.detector.process(frame)
+                self._confidence = conf
+                fingers   = HandDetector.fingers_up(lm)
+                g         = self.gestures.update(fingers)
 
-                elif g == "screenshot":
-                    self._end_stroke()
-                    self._screenshot(frame)
+                if lm:
+                    x1, y1 = self.smoother.update(lm[8][1], lm[8][2])
 
-                elif g == "select":
-                    self._end_stroke()
-                    cv2.circle(frame, (x1, y1), 18, (255, 255, 255), 2)
-                    cv2.circle(frame, (x1, y1),  4, (255, 255, 255), -1)
-                    hit = self.ui.hit_palette(x1, y1)
-                    if hit is not None:
-                        self.color = hit
+                    if g == "clear":
+                        self._end_stroke()
+                        self.canvas = np.zeros_like(self.canvas)
+                        self.toast.show("CANVAS CLEARED", (60, 60, 255))
 
-                elif g == "draw":
-                    if not self._drawing:
-                        self._drawing = True
+                    elif g == "screenshot":
+                        self._end_stroke()
+                        self._screenshot(frame)
+
+                    elif g == "select":
+                        self._end_stroke()
+                        cv2.circle(frame, (x1, y1), 18, (255, 255, 255), 2)
+                        cv2.circle(frame, (x1, y1),  4, (255, 255, 255), -1)
+                        hit = self.ui.hit_palette(x1, y1)
+                        if hit is not None:
+                            self.color = hit
+                            logger.debug("Color changed")
+
+                    elif g == "draw":
+                        if not self._drawing:
+                            self._drawing = True
+                            self._xp, self._yp = x1, y1
+
+                        thick = CFG.eraser_size if self.color == (0, 0, 0) else self.brush
+                        if self._xp and self._yp:
+                            cv2.line(frame,       (self._xp, self._yp), (x1, y1), self.color, thick)
+                            cv2.line(self.canvas, (self._xp, self._yp), (x1, y1), self.color, thick)
+                        tip_col = self.color if self.color != (0, 0, 0) else (140, 140, 140)
+                        cv2.circle(frame, (x1, y1), thick // 2, tip_col, -1)
                         self._xp, self._yp = x1, y1
 
-                    thick = CFG.eraser_size if self.color == (0, 0, 0) else self.brush
-                    if self._xp and self._yp:
-                        cv2.line(frame,       (self._xp, self._yp), (x1, y1), self.color, thick)
-                        cv2.line(self.canvas, (self._xp, self._yp), (x1, y1), self.color, thick)
-                    tip_col = self.color if self.color != (0, 0, 0) else (140, 140, 140)
-                    cv2.circle(frame, (x1, y1), thick // 2, tip_col, -1)
-                    self._xp, self._yp = x1, y1
-
+                    else:
+                        self._end_stroke()
                 else:
                     self._end_stroke()
-            else:
-                self._end_stroke()
 
-            frame = self._merge(frame)
+                # Composite + UI
+                frame = self._merge(frame)
 
-            now  = time.time()
-            fps  = 1.0 / max(now - self._ptime, 1e-5)
-            self._ptime = now
+                now   = time.time()
+                fps   = 1.0 / max(now - self._ptime, 1e-5)
+                self._ptime = now
 
-            self.ui.draw_palette(frame, self.color)
-            self.ui.draw_hud(frame, g, self.brush, self.color, fps)
-            self.toast.render(frame, self.ui)
+                self.ui.draw_palette(frame, self.color)
+                self.ui.draw_hud(frame, g, self.brush, self.color, fps, self._confidence)
+                self.toast.render(frame, self.ui)
+                if self._show_help:
+                    self.ui.draw_help(frame)
 
-            cv2.imshow("Air Drawing AI", frame)
+                cv2.imshow("Air Drawing AI", frame)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('s'):
-                self._screenshot(frame)
-            elif key in (ord('+'), ord('=')):
-                self.brush = min(self.brush + CFG.brush_step, CFG.max_brush)
-            elif key == ord('-'):
-                self.brush = max(self.brush - CFG.brush_step, CFG.min_brush)
+                # Keyboard
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    logger.info("Quit")
+                    break
+                elif key == ord('s'):
+                    self._screenshot(frame)
+                elif key == ord('h'):
+                    self._show_help = not self._show_help
+                elif key in (ord('+'), ord('=')):
+                    self.brush = min(self.brush + CFG.brush_step, CFG.max_brush)
+                    logger.debug(f"Brush -> {self.brush}")
+                elif key == ord('-'):
+                    self.brush = max(self.brush - CFG.brush_step, CFG.min_brush)
+                    logger.debug(f"Brush -> {self.brush}")
+                elif key == ord('['):
+                    self._set_confidence(-0.05)
+                elif key == ord(']'):
+                    self._set_confidence(+0.05)
 
-        self.cap.release()
-        cv2.destroyAllWindows()
+                # Frame-rate cap
+                elapsed = time.time() - t0
+                if elapsed < target_dt:
+                    time.sleep(target_dt - elapsed)
+
+                self._frame_count += 1
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted")
+        except Exception as e:
+            logger.error(f"Runtime error: {e}", exc_info=True)
+        finally:
+            logger.info(f"Closed after {self._frame_count} frames")
+
+
+# ════════════════════════════════════════════════════════
+#  ENTRY
+# ════════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(
+        description="Air Drawing AI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python air_drawing.py
+  python air_drawing.py --camera 1 --width 1280 --height 720
+  python air_drawing.py --fps-limit 60 --debug
+  python air_drawing.py --detection-conf 0.8 --show-confidence
+        """,
+    )
+    parser.add_argument("--camera",           type=int,   default=0,    help="Camera ID (default 0)")
+    parser.add_argument("--width",            type=int,   default=1280, help="Frame width")
+    parser.add_argument("--height",           type=int,   default=720,  help="Frame height")
+    parser.add_argument("--fps-limit",        type=int,   default=30,   help="FPS cap")
+    parser.add_argument("--detection-conf",   type=float, default=0.75, help="Detection confidence 0-1")
+    parser.add_argument("--tracking-conf",    type=float, default=0.75, help="Tracking confidence 0-1")
+    parser.add_argument("--debug",            action="store_true",      help="Verbose logging")
+    parser.add_argument("--show-confidence",  action="store_true",      help="Show confidence in HUD")
+
+    args = parser.parse_args()
+
+    CFG.camera_id       = args.camera
+    CFG.cam_w           = args.width
+    CFG.cam_h           = args.height
+    CFG.fps_limit       = args.fps_limit
+    CFG.detection_conf  = args.detection_conf
+    CFG.tracking_conf   = args.tracking_conf
+    CFG.debug_mode      = args.debug
+    CFG.show_confidence = args.show_confidence
+
+    if CFG.debug_mode:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug mode on")
+
+    print(__doc__)
+
+    try:
+        with AirDrawingApp() as app:
+            app.run()
+    except Exception as e:
+        logger.error(f"Fatal: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    AirDrawingApp().run()
+    main()
