@@ -204,4 +204,22 @@ cython_debug/
 # Marimo
 marimo/_static/
 marimo/_lsp/
-__marimo__/
+__marimo__/# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# Virtual environment
+venv/
+env/
+# Your screenshots - private!
+Screenshots/
+*.png
+*.jpg
+# OS files
+.DS_Store
+Thumbs.db
+
+
+
+
